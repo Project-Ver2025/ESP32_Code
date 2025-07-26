@@ -13,8 +13,7 @@
 #include <BLE2902.h>
 
 // ===== WIFI CONFIG ======
-// const char* ssid = "WiFi-9B0392";
-// const char* password = "84920317";
+
 const char* ssid = "";
 const char* password = "!";
 
