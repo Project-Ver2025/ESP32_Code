@@ -31,4 +31,5 @@ Gemini is used in the:
 
 The device uses the Android TTS library to output the text to the phone speaker or the connected headphones through the [Project Ver app](https://github.com/Project-Ver2025/Project_Ver). 
 
-<img width="1531" height="838" alt="image" src="https://github.com/user-attachments/assets/b7a3dca2-c1e5-4ac8-b9e7-8f135e00b004" />
+<img width="1541" height="843" alt="image" src="https://github.com/user-attachments/assets/d2d69e1e-8a1f-417e-903d-439c758f4df9" />
+
