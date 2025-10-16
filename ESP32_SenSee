@@ -1,0 +1,1399 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <base64.h>
+#include "esp_camera.h"
+#include <ArduinoJson.h>
+#include <Arduino.h>
+#include "ESP_I2S.h"
+#include "wav_header.h"
+#include <WiFiClientSecure.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <iostream>
+#include <unordered_map>
+#include <sstream>
+#include "SPI.h"
+#include <esp_timer.h>  
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include <regex>
+#include <string>
+
+// ===== WIFI CONFIG ======
+const char* ssid = "";
+const char* password = "";
+
+// Checking to confirm wifi is still connected
+unsigned long lastWifiCheck = 0;
+const unsigned long wifiCheckInterval = 30000; // Checked every 30 seconds
+
+// ===== LLM CONFIG ======
+String groqApiKey = "";
+String  geminiApiKey = "";  
+SemaphoreHandle_t httpMutex;
+
+// ===== ALTERNATING VLMs ======
+bool vlmModel = true;
+
+// ===== AUDIO CONFIG ======
+#define SAMPLE_RATE     (16000)
+#define DATA_PIN        41 
+#define CLOCK_PIN       42
+bool isRecording = false;
+std::vector<uint8_t> audioBuffer;
+I2SClass i2s;
+
+
+// ===== CAMERA CONFIG ======
+#define PWDN_GPIO_NUM  -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM  10 
+#define SIOD_GPIO_NUM  40
+#define SIOC_GPIO_NUM  39
+#define Y9_GPIO_NUM    48
+#define Y8_GPIO_NUM    11
+#define Y7_GPIO_NUM    12
+#define Y6_GPIO_NUM    14
+#define Y5_GPIO_NUM    16
+#define Y4_GPIO_NUM    18
+#define Y3_GPIO_NUM    17
+#define Y2_GPIO_NUM    15
+#define VSYNC_GPIO_NUM 38
+#define HREF_GPIO_NUM  47
+#define PCLK_GPIO_NUM  13
+
+// ===== BLE CONFIG ======
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "abcd1234-abcd-1234-abcd-1234567890ab"
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+unsigned long lastBLECheck = 0;
+const unsigned long BLE_CHECK_INTERVAL = 10000;
+// Once the remote and the phone are connected
+bool both_connected = false;
+
+// ===== OBJECT SEARCHING CONFIG ======
+TaskHandle_t objectSearchTaskHandle = NULL;
+bool cancelObjectSearch = false;
+String objectToSearch = "";
+
+// ===== APP COMMAND ======
+String receivedCommand = ""; 
+static unsigned long lastCommandTime = 0;
+String lastReceivedCommand = "";
+bool cancelled = false;
+
+//========  CAMERA STORE =====
+String cachedBase64Image = "";
+uint64_t cachedImageTime = 0; // in microseconds
+const uint64_t IMAGE_CACHE_VALID_US = 3000000ULL; // 3 seconds
+SemaphoreHandle_t imageCacheMutex;
+
+// Stored commands
+std::unordered_map<int, std::string> dictionary;
+std::unordered_map<int, String> task_correspondence;
+
+// Stored Preferences
+String responseSpeed = "Normal";   // "Fast" or "Normal"
+String responseLength = "Long";   // "Short" or "Long"
+
+// Recording timeouts
+unsigned long recordingStartTime = 0;    // millis() when recording started
+int RECORDING_TIMEOUT = 5000;  // 5 seconds in ms
+unsigned long lastStopTime = 0; //Checker to not send XStop (which triggers stop sound) twice
+
+// Memory management buffers
+#define MAX_PAYLOAD_SIZE 65536
+#define MAX_RESPONSE_SIZE 8192
+#define MAX_BASE64_SIZE 24576
+
+static char* payloadBuffer = nullptr;
+static char* responseBuffer = nullptr;
+static char* base64Buffer = nullptr;
+
+
+
+
+/*
+****************************************************************
+*******    MEMORY BUFFER INITIALISATION
+****************************************************************
+*/
+void initBuffers() {
+  if (!payloadBuffer) payloadBuffer = (char*)ps_malloc(MAX_PAYLOAD_SIZE);
+  if (!responseBuffer) responseBuffer = (char*)ps_malloc(MAX_RESPONSE_SIZE);  
+  if (!base64Buffer) base64Buffer = (char*)ps_malloc(MAX_BASE64_SIZE);
+}
+
+
+/*
+****************************************************************
+*******    CAMERA INITIALISATION
+****************************************************************
+*/
+void initCamera(){
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_VGA;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 6;
+  config.fb_count = 1;
+
+  if (psramFound()) {
+    config.grab_mode = CAMERA_GRAB_LATEST;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 2);
+    s->set_saturation(s, 1);
+  }
+
+  // Exposure and Gain
+  s->set_exposure_ctrl(s, 1);  // Auto exposure
+  s->set_gain_ctrl(s, 1);      // Auto gain
+  s->set_hmirror(s, 1);
+
+  // White balance
+  s->set_whitebal(s, 1);       // Auto white balance
+
+  // Reduce motion blur / instability
+  s->set_aec2(s, 1);           // Enable AEC DSP
+  s->set_lenc(s, 1);           // Lens correction
+}
+
+
+/*
+****************************************************************
+*******    BLE SERVER
+****************************************************************
+*/
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    Serial.println("Client connected");
+    pServer->startAdvertising();
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    Serial.println("Client disconnected");
+    delay(500);
+    pServer->startAdvertising();
+    Serial.println("Advertising restarted");
+  }
+};
+
+void resetBLE() {
+  Serial.println("Resetting BLE...");
+  
+  // Stop advertising
+  BLEDevice::getAdvertising()->stop();
+  delay(1000);
+  
+  // Restart advertising
+  BLEDevice::getAdvertising()->start();
+  Serial.println("BLE reset complete");
+}
+
+
+/*
+****************************************************************
+*******    SETUP
+****************************************************************
+*/
+void setup() {
+  
+  Serial.begin(115200);
+  delay(1000);
+
+  //--------------------- Initialise Buffers
+  initBuffers();
+  if (!payloadBuffer || !responseBuffer || !base64Buffer) {
+    Serial.println("Failed to allocate buffers! Restarting...");
+    ESP.restart();
+  }
+
+  //--------------------- Initialise Camera & Image Lock
+  initCamera();
+
+  imageCacheMutex = xSemaphoreCreateMutex();
+  if (imageCacheMutex == NULL) {
+    Serial.println("Failed to create image cache mutex");
+  } else {
+    Serial.println("Image cache mutex created");
+  }
+
+  //--------------------- Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi!");
+
+  //--------------------- Initialise BLE
+  BLEDevice::init("ESP32S3_BLE");
+  pServer = BLEDevice::createServer();
+
+  // Add server callbacks to handle connect/disconnect
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  class CommandCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pChar) override {
+    std::string rx = std::string(pChar->getValue().c_str());
+    if (!rx.empty()) {
+      String rxValue = String(rx.c_str());
+      unsigned long now = millis();
+
+      // Check if this is a duplicate command within cooldown period
+      if (rxValue == lastReceivedCommand && (now - lastCommandTime) < 500) {
+        Serial.println("DUPLICATE DETECTED - Ignoring");
+        return; // Exit early, don't process
+      }
+      
+      // This is a new/valid command
+      Serial.println("ACCEPTING command: " + rxValue);
+      receivedCommand = rxValue;
+      String command = receivedCommand;
+      command.trim();
+      command.toLowerCase();
+
+      if (command == "cancel" || command == "xcancel") {
+        cancelled = true;
+      } else {
+        cancelled = false;
+      }
+      lastReceivedCommand = rxValue;  // Remember this command
+      lastCommandTime = now;          // Update timestamp 
+    }
+  }
+  };
+
+  pCharacteristic->setCallbacks(new CommandCallback());
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE Server started");
+  BLEDevice::setMTU(517);
+  
+  //--------------------- Initialise HTTP Lock
+  httpMutex = xSemaphoreCreateMutex();
+  if (!httpMutex) {
+    Serial.println("Failed to create httpMutex");
+  }
+
+}
+
+
+/*
+****************************************************************
+*******    BLE SEND TO PHONE
+****************************************************************
+*/
+void sendLongStringOverBLE(const String &msg, bool force=false) {
+
+  if (cancelled && !force) {
+    return;
+  }
+
+  if (!pCharacteristic) {
+    Serial.println("BLE characteristic not ready, skipping send");
+    return;
+  }
+  const size_t chunkSize = 20;  
+  size_t len = msg.length();
+  for (size_t i = 0; i < len; i += chunkSize) {
+    String chunk = msg.substring(i, i + chunkSize);
+    pCharacteristic->setValue(chunk.c_str());
+    pCharacteristic->notify();
+    Serial.println("Sent chunk: " + chunk);
+    delay(50);
+  }
+}
+
+/*
+****************************************************************
+*******    IMAGE CAPTURE
+****************************************************************
+*/
+camera_fb_t* captureFinalFrameBuffer() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (responseSpeed == "Normal") {
+    Serial.println("Normal Image quality");
+    s->set_quality(s, 6);
+    s->set_framesize(s, FRAMESIZE_SVGA); // 800x600
+  } else if (responseSpeed == "Fast") {
+    Serial.println("Fast Image quality");
+    s->set_quality(s, 8);
+    s->set_framesize(s, FRAMESIZE_HVGA); // 320x480
+  } 
+  delay(50);
+
+  // Capture and discard 4 images to allow lens to focus and adjust
+  for (int i = 0; i < 4; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return nullptr;
+  }
+  return fb;
+}
+
+
+String getCachedOrNewBase64Image() {
+  uint64_t now = esp_timer_get_time();
+
+  if (xSemaphoreTake(imageCacheMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    // Check if cache is still valid
+    if (!cachedBase64Image.isEmpty() && (now - cachedImageTime) < IMAGE_CACHE_VALID_US) {
+      Serial.println("Using cached image");
+      xSemaphoreGive(imageCacheMutex);
+      return cachedBase64Image;
+    }
+
+    // Capture new image
+    camera_fb_t* fb = captureFinalFrameBuffer();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      xSemaphoreGive(imageCacheMutex);
+      return "";
+    }
+
+    String base64Image = base64::encode(fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+
+    // Update cache
+    cachedBase64Image = base64Image;
+    cachedImageTime = now;
+
+    Serial.println("Captured new image and updated cache");
+    xSemaphoreGive(imageCacheMutex);
+    return cachedBase64Image;
+
+  } else {
+    Serial.println("Could not get mutex, returning empty image");
+    return "";
+  }
+}
+
+
+/*
+****************************************************************
+*******    GEMINI
+****************************************************************
+*/
+String askGeminiWithSearch(const String& prompt, int retry_attempts = 0) {
+
+  if (cancelled) {
+    return "";
+  }
+
+  if (xSemaphoreTake(httpMutex, 0) != pdTRUE) {
+    Serial.println("Could not get httpMutex, skipping request");
+    return "Busy";
+  }
+
+  String base64Image = "";
+  for (int i = 0; i < 3; i++) {
+    base64Image = getCachedOrNewBase64Image();
+    if (base64Image.isEmpty()) {
+      Serial.println("Failed to get image");
+    } else {
+      break;
+    }
+  }
+
+  if (base64Image.isEmpty()) {
+      Serial.println("Failed to get image");
+      xSemaphoreGive(httpMutex);
+      return "Image error";
+  } 
+  
+  String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + geminiApiKey;
+  
+  if (!payloadBuffer) {
+    Serial.println("Payload buffer not initialized");
+    xSemaphoreGive(httpMutex);
+    return "Buffer error";
+  }
+  
+  HTTPClient http;
+  http.begin(endpoint);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  http.addHeader("Connection", "close");
+
+  int wordCount = (responseLength == "Short") ? 20 : 50;
+
+  // Build JSON using buffer
+  int written = snprintf(payloadBuffer, MAX_PAYLOAD_SIZE,
+    "{\"contents\": [{\"parts\": ["
+    "{ \"text\": \"%s, use the image if required, answer in less than %d words and also for context I am blind take that into consideration in your response, do not say anything about being blind, use metric units for any distances and I am in Canberra, Australia\" },"
+    "{\"inline_data\": {\"mime_type\": \"image/jpeg\",\"data\": \"%s\"}}]}],"
+    "\"tools\": [{ \"google_search\": {} }]}",
+    prompt.c_str(), wordCount, base64Image.c_str());
+  
+  Serial.println("Sending request to Gemini API...");
+  int httpCode = http.POST((uint8_t*)payloadBuffer, strlen(payloadBuffer));
+  
+  String result = "";
+  if (httpCode == 200) {
+    String response = http.getString();
+    int stringLength = response.length(); 
+    
+    if (stringLength < 10) {
+      http.end();
+      yield();
+      xSemaphoreGive(httpMutex);
+
+      if (retry_attempts < 3) {
+        Serial.printf("Response too short (%d chars), retry %d/3\n", stringLength, retry_attempts + 1);
+        return askGeminiWithSearch(prompt, retry_attempts + 1);
+      } else {
+        Serial.println("Max retries reached for short response");
+        return "Model is busy, try again later";
+      }
+    }
+    
+    DynamicJsonDocument doc(4096);
+    
+    if (deserializeJson(doc, response) == DeserializationError::Ok) {
+      const char* reply = doc["candidates"][0]["content"]["parts"][0]["text"];
+      if (reply) result = String(reply);
+    }
+  } else {
+    http.end();
+    yield();
+    xSemaphoreGive(httpMutex);
+    if (retry_attempts < 3) {
+        return askGeminiWithSearch(prompt, retry_attempts + 1);
+      } else {
+        Serial.println("Max retries reached for short response");
+        return "Model is busy, try again later";
+    }
+  }
+  
+  http.end();
+  yield();
+  xSemaphoreGive(httpMutex);
+  
+  return result;
+}
+
+/*
+****************************************************************
+*******    GROQ
+****************************************************************
+*/
+
+String send_to_groq(String model, const String& input_message, bool image_required, int retry_attempts = 0) {
+
+  if (cancelled) {
+    return "";
+  }
+
+  if (xSemaphoreTake(httpMutex, 0) != pdTRUE) {
+    Serial.println("Could not get httpMutex, skipping request");
+    return "Busy";
+  }
+
+  String result = "";
+  String base64Image = "";
+  
+  // Capture image if needed
+  if (image_required) {
+
+    for (int i = 0; i < 3; i++) {
+      base64Image = getCachedOrNewBase64Image();
+      if (base64Image.isEmpty()) {
+        Serial.println("Failed to get image");
+      } else {
+        break;
+      }
+    }
+
+    if (base64Image.isEmpty()) {
+        Serial.println("Failed to get image");
+        xSemaphoreGive(httpMutex);
+        return "Image error";
+    } 
+  }
+  
+  // Use pre-allocated buffer instead of dynamic String
+  if (!payloadBuffer) {
+    Serial.println("Payload buffer not initialized");
+    xSemaphoreGive(httpMutex);
+    return "Buffer error";
+  }
+
+  int wordCount = (responseLength == "Short") ? 20 : 50;
+
+  memset(payloadBuffer, 0, MAX_PAYLOAD_SIZE);
+
+  if (image_required) {
+    int written = snprintf(payloadBuffer, MAX_PAYLOAD_SIZE,
+      "{"
+        "\"model\":\"%s\","
+        "\"messages\":[{"
+          "\"role\":\"user\","
+          "\"content\":["
+            "{ \"type\":\"text\", \"text\":\"%s, answer in less than %d words using the image and also for context I am blind take that into consideration in your response, do not say anything about being blind, use metric units for any distances\" },"
+            "{ \"type\":\"image_url\", \"image_url\":{\"url\":\"data:image/jpeg;base64,%s\"}}"
+          "]"
+        "}],"
+        "\"temperature\":1,"
+        "\"max_tokens\":1024,"
+        "\"top_p\":1,"
+        "\"stream\":false"
+      "}",
+      model.c_str(), input_message.c_str(), wordCount, base64Image.c_str());
+  } else {
+    int written = snprintf(payloadBuffer, MAX_PAYLOAD_SIZE,
+      "{"
+        "\"model\":\"%s\","
+        "\"messages\":[{"
+          "\"role\":\"user\","
+          "\"content\":[{ \"type\":\"text\", \"text\":\"%s, in less than %d words\"}]"
+        "}],"
+        "\"max_tokens\":512"
+      "}",
+      model.c_str(), input_message.c_str(), wordCount);
+  }
+  
+  HTTPClient http;
+  // Configure HTTP client with timeouts
+  http.begin("https://api.groq.com/openai/v1/chat/completions");
+  http.setTimeout(10000); // 10 second total timeout
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + String(groqApiKey));
+  http.addHeader("Connection", "close"); // Ensure connection closes
+  
+  Serial.println("Sending request to Groq...");
+  int httpCode = http.POST((uint8_t*)payloadBuffer, strlen(payloadBuffer));
+  
+  if (httpCode == 200) {
+    Serial.printf("HTTP %d\n", httpCode);
+
+    String response = http.getString();
+    int stringLength = response.length(); 
+
+    // Check if response is too short (likely an error)
+    if (stringLength < 10) {
+      http.end();
+      yield();
+      delay(50);
+      xSemaphoreGive(httpMutex);
+      
+      if (retry_attempts < 3) {
+        Serial.printf("Response too short (%d chars), retry %d/3\n", stringLength, retry_attempts + 1);
+        return send_to_groq(model, input_message, image_required, retry_attempts + 1);
+      } else {
+        Serial.println("Max retries reached for short response");
+        return "Model is Busy, Try Again Later";
+      }
+    }
+
+    if (response.length() > MAX_RESPONSE_SIZE) {
+      Serial.println("Response too large, truncating");
+      response = response.substring(0, MAX_RESPONSE_SIZE);
+    }
+    
+    // Parse JSON more efficiently
+    DynamicJsonDocument doc(4096); // Reduced size
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (!error) {
+      const char* content = doc["choices"][0]["message"]["content"];
+      if (content) {
+        result = String(content);
+      }
+    } else {
+      Serial.printf("JSON parse error: %s\n", error.c_str());
+      result = "Parse error";
+    }
+  } else {
+    http.end();
+    // Force garbage collection
+    yield();
+    delay(50);
+    xSemaphoreGive(httpMutex);
+    if (retry_attempts < 3) {
+      return send_to_groq(model, input_message, image_required, retry_attempts + 1);
+    } else {
+      Serial.println("Max retries reached for short response");
+      return "Model is Busy, Try Again Later";
+    }
+  }
+  
+  http.end();
+  // Force garbage collection
+  yield();
+  delay(50);
+  xSemaphoreGive(httpMutex);
+  
+  return result;
+}
+
+
+
+/*
+****************************************************************
+*******    WHISPER
+****************************************************************
+*/
+
+String sendToWhisper(uint8_t* wav_buffer, size_t wav_size, int whisper_attempts = 0) {
+  if (cancelled) {
+    return "";
+  }
+
+  bool gotMutex = false;
+  for (int i = 0; i < 30; i++) {
+    if (xSemaphoreTake(httpMutex, 0) == pdTRUE) {
+      gotMutex = true;
+      break;
+    }
+    delay(50);
+  }
+  if (!gotMutex) {
+    Serial.println("Failed to acquire httpMutex, aborting sendToWhisper");
+    return "Mutex busy";
+  }
+
+  HTTPClient http;
+
+  http.begin("https://api.groq.com/openai/v1/audio/transcriptions");
+  http.addHeader("Authorization", "Bearer " + String(groqApiKey));
+  http.setTimeout(10000);
+
+  String boundary = "----ESP32FormBoundary7MA4YWxkTrZu0gW";
+  String formStart = "--" + boundary + "\r\n";
+  formStart += "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n";
+  formStart += "Content-Type: audio/wav\r\n\r\n";
+  String formMiddle = "\r\n--" + boundary + "\r\n";
+  formMiddle += "Content-Disposition: form-data; name=\"model\"\r\n\r\n";
+  formMiddle += "whisper-large-v3-turbo\r\n";
+  String formEnd = "--" + boundary + "--\r\n";
+
+  uint8_t* fullPayload = (uint8_t*)malloc(formStart.length() + wav_size + formMiddle.length() + formEnd.length());
+  size_t offset = 0;
+  memcpy(fullPayload + offset, formStart.c_str(), formStart.length()); offset += formStart.length();
+  memcpy(fullPayload + offset, wav_buffer, wav_size); offset += wav_size;
+  memcpy(fullPayload + offset, formMiddle.c_str(), formMiddle.length()); offset += formMiddle.length();
+  memcpy(fullPayload + offset, formEnd.c_str(), formEnd.length()); offset += formEnd.length();
+
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  int httpCode = http.POST(fullPayload, offset);
+  free(fullPayload);
+
+  if (httpCode > 0 && httpCode == 200) {
+    String response = http.getString();
+    DynamicJsonDocument doc(2048);
+    if (deserializeJson(doc, response) == DeserializationError::Ok) {
+        http.end();
+        yield();
+        delay(50);
+        xSemaphoreGive(httpMutex);
+        whisper_attempts = 0;
+        return String((const char*)doc["text"]);
+    }
+  }
+  http.end();
+  yield();
+  delay(50);
+  xSemaphoreGive(httpMutex);
+
+  if (whisper_attempts < 3) {
+    Serial.printf("Retry attempt %d/3\n", whisper_attempts + 1);
+    return sendToWhisper(wav_buffer, wav_size, whisper_attempts + 1);  // RETURN the result!
+  }
+  
+  return "Model Busy, Try Again";
+}
+
+/*
+****************************************************************
+*******    START AUDIO RECORDING
+****************************************************************
+*/
+void startRecording() {
+  audioBuffer.clear();
+  i2s.setPinsPdmRx(CLOCK_PIN, DATA_PIN);
+  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println("Failed to initialize I2S PDM RX");
+    return;
+  }
+  isRecording = true;
+  recordingStartTime = millis();
+}
+
+/*
+****************************************************************
+*******    STOP AUDIO RECORDING
+****************************************************************
+*/
+String stopRecordingAndSend(bool sending) {
+  isRecording = false;
+  i2s.end();
+
+  if (!sending) {
+    Serial.println("Cancelled");
+    return "";
+  }
+  if (audioBuffer.size() == 0) {
+    Serial.println("No audio data captured.");
+    return "No audio data";
+  }
+
+  Serial.println("Sending audio to Whisper...");
+
+  if (cancelled) {
+    return "cancel";
+  }
+
+  // Create WAV header
+  uint32_t totalAudioLen = audioBuffer.size();
+  uint32_t totalDataLen = totalAudioLen + 36;
+  uint32_t byteRate = SAMPLE_RATE * 2;
+  uint8_t wavHeader[44];
+
+  memcpy(wavHeader, "RIFF", 4);
+  *(uint32_t*)(wavHeader + 4) = totalDataLen;
+  memcpy(wavHeader + 8, "WAVEfmt ", 8);
+  *(uint32_t*)(wavHeader + 16) = 16;
+  *(uint16_t*)(wavHeader + 20) = 1;
+  *(uint16_t*)(wavHeader + 22) = 1;
+  *(uint32_t*)(wavHeader + 24) = SAMPLE_RATE;
+  *(uint32_t*)(wavHeader + 28) = byteRate;
+  *(uint16_t*)(wavHeader + 32) = 2;
+  *(uint16_t*)(wavHeader + 34) = 16;
+  memcpy(wavHeader + 36, "data", 4);
+  *(uint32_t*)(wavHeader + 40) = totalAudioLen;
+
+  // Allocate final WAV buffer
+  size_t wav_size = totalAudioLen + 44;
+  uint8_t* wav_buffer = (uint8_t*)malloc(wav_size);
+  memcpy(wav_buffer, wavHeader, 44);
+  memcpy(wav_buffer + 44, audioBuffer.data(), totalAudioLen);
+
+  if (!wav_buffer || wav_size == 0) {
+    Serial.println("Empty WAV buffer, skipping Whisper");
+    return "No audio data";
+  }
+
+  // Call upload logic
+  String result = sendToWhisper(wav_buffer, wav_size);
+  Serial.println("Transcription:");
+  Serial.println(result);
+  free(wav_buffer);
+
+  if (cancelled) {
+    return "cancel";
+  }
+
+  return result;
+}
+
+
+/*
+****************************************************************
+*******    TASK CLASSIFICATION
+****************************************************************
+*/
+String task_classification(String voice_input){
+  if (voice_input == "No audio data") {
+    sendLongStringOverBLE("No audio data captured, attemping general help<EOM>");
+  }
+
+  String input_message = "You are a strict classifier. Based on the user input, output ONLY the task number (1–8) ";
+  input_message += "and any required modifiers, nothing else. Never add extra text or explanations.";
+  input_message += "User input: " + voice_input + " Tasks: ";
+  // Task 1
+  input_message += "1. Live Task Execution → The user wants an action triggered by an event or condition.";
+  input_message += " Examples: 'Tell me when you see a cat' → 1, 'Notify me if the light turns red' → 1";
+  // Task 2
+  input_message += "2. Image Analysis/Question → The user asks about or requests a description of an image.";
+  input_message += " Examples: 'Describe what's in front of me' → 2, 'Is there a laptop in this picture?' → 2";
+  // Task 3
+  input_message += "3. General Conversation/Information Retrieval → Chat or factual questions.";
+  input_message += " Examples: 'What's the weather like?' → 3, 'Tell me a joke' → 3";
+  // Task 4
+  input_message += "4. Image Reading → The user wants text in an image read aloud or interpreted.";
+  input_message += " Examples: 'Read this sign' → 4, 'Does this label have gluten?' → 4, 'What does this say -> 4";
+  // Task 5
+  input_message += "5. Help → General assistance, or fallback when unclear.";
+  input_message += " Examples: 'Help me' → 5, 'No audio data' → 5";
+  // Task 6
+  input_message += "6. Response Modification → The user wants to change LLM response speed or length.";
+  input_message += " Options: Speed = Fast, Normal | Length = Short, Long";
+  input_message += " Examples: 'Make responses fast and long' → 6, Fast Long, 'Short answers please' → 6, Short";
+  // Task 7
+  input_message += "7. TTS Speed Modification → Adjust text-to-speech playback speed.";
+  input_message += " Examples: 'Make the speech slower, 0.5 times speed' → 7, 0.5, 'Make the speaking speed two times' → 7, 2";
+  // Task 8
+  input_message += "8. Recording Timeout Adjustment → Adjust how long recording continues before auto-stop.";
+  input_message += " Value must be in seconds.";
+  input_message += " Examples: 'Set recording timeout to 30 seconds' → 8, 30, 'Make timeout 5s' → 8, 5";
+
+  input_message += "Return format examples: '1', '6, Fast Long', '7, 1.5',  '8, 20'";
+  input_message += "Output ONLY the number (and modifiers if required). No other text.";
+
+  String task = "";
+
+  while (true) {
+    task = send_to_groq("llama-3.3-70b-versatile", input_message, false);
+    if (task != "Busy") {
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  if (cancelled) {
+    return "";
+  }
+  return task;
+}
+
+
+/*
+****************************************************************
+*******    OBJECT SEARCHING
+****************************************************************
+*/
+void objectSearchTask(void* parameter) {
+  String objectName = objectToSearch; // Copy the global variable
+  
+  Serial.println("Object search task started for: " + objectName);
+  
+  bool found = false;
+  int attempts = 0;
+
+  while (!found) {
+
+    if (cancelObjectSearch) {
+      break;
+    }
+
+    if (objectName != objectToSearch) {
+      objectName = objectToSearch;
+    }
+    attempts++;
+    Serial.println("Search attempt " + String(attempts));
+    
+    // Add watchdog reset to prevent reboot
+    yield();
+
+    // Simple model selection
+    String model = vlmModel ? "meta-llama/llama-4-maverick-17b-128e-instruct" : "meta-llama/llama-4-scout-17b-16e-instruct";
+    vlmModel = !vlmModel;
+
+    // Shorter prompt to reduce payload size
+    String prompt = "Is there a " + objectName + " in this image? Answer yes or no only,  if yes only tell me where it is using clockface coordinates using only between 10 and 2 o'clock with 10 o'clock being leftmost and 2 o'clock being rightmost and its relative position, give distance estimate in metres";
+
+    String response = send_to_groq(model, prompt, true);
+
+    if (response == "Busy") {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    if (response.indexOf("yes") != -1 || response.indexOf("Yes") != -1) {
+      found = true;
+      Serial.println("Object found!");
+      sendLongStringOverBLE("Found " + objectName + ". " + response + "<EOM>");
+    } else {
+      Serial.println("Object not found, retrying...");
+    }
+
+    delay(10000); // Wait before next attempt
+    yield(); // Allow other tasks to run
+  }
+
+  Serial.println("Object search task ending");
+  objectSearchTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+void performTask(String task_selected, String transcription) {
+  if (cancelled) {
+    return;
+  }
+  
+  Serial.println("Task: " + task_selected);
+  Serial.println("Transcription: " + transcription);
+
+  if (task_selected == "1") {    
+    // Extract object from transcription
+    String input_prompt = "What object should I search for in: " + transcription + "? Reply with just the object name.";
+    String objectName = send_to_groq("llama-3.3-70b-versatile", input_prompt, false);
+    objectName.trim();
+    
+    if (objectName.length() > 2 && objectName.indexOf("no object") == -1) {
+      Serial.println("Will search for: " + objectName);
+      
+      // Check if we already have a task running
+      if (objectSearchTaskHandle != NULL) {
+        Serial.println("Updating existing search to: " + objectName);
+        objectToSearch = objectName;  // Just update the search target
+        cancelObjectSearch = false;   // Make sure it's not cancelled
+        sendLongStringOverBLE("Updated search to: " + objectName + "<EOM>");
+      } else {
+        // Create new task
+        objectToSearch = objectName;
+        cancelObjectSearch = false;
+
+        if (cancelled) {
+          return;
+        }
+        
+        BaseType_t result = xTaskCreatePinnedToCore(
+          objectSearchTask,
+          "ObjSearch",
+          16384,
+          NULL,
+          1,
+          &objectSearchTaskHandle,
+          0
+        );
+        
+        if (result == pdPASS) {
+          Serial.println("Task created");
+          sendLongStringOverBLE("Searching for: " + objectName + "<EOM>");
+        } else {
+          Serial.println("Task creation failed");
+          sendLongStringOverBLE("Search failed to start<EOM>");
+        }
+      }
+    } else {
+      Serial.println("No valid object found");
+      sendLongStringOverBLE("No object to search for<EOM>");
+    }
+  }
+  else if (task_selected == "2" || task_selected == "4") {
+    sendLongStringOverBLE("I understood " + transcription + " , performing now <EOM>");
+
+    String model = vlmModel ? "meta-llama/llama-4-maverick-17b-128e-instruct" : "meta-llama/llama-4-scout-17b-16e-instruct";
+    vlmModel = !vlmModel;
+    String content = "";
+    while (true) {
+      content = send_to_groq(model, transcription, true);
+      if (content != "Busy") {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (cancelled) {
+      return;
+    }
+    sendLongStringOverBLE(content + "<EOM>");
+  } else if (task_selected == "3") {
+    sendLongStringOverBLE("I understood " + transcription + " , performing now <EOM>");
+
+    String content = "";
+    while (true) {
+      content = askGeminiWithSearch(transcription);
+      if (content != "Busy") {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (cancelled) {
+      return;
+    }
+
+    sendLongStringOverBLE(content + "<EOM>");
+
+  } else if (task_selected == "5") {
+    sendLongStringOverBLE("I understood " + transcription + " , performing now <EOM>");
+    String model = vlmModel ? "meta-llama/llama-4-maverick-17b-128e-instruct" : "meta-llama/llama-4-scout-17b-16e-instruct";
+    vlmModel = !vlmModel;
+    String content = "";
+    while (true) {
+      content = send_to_groq(model, "I have no vision, use this photo as context and tell me what you think I need to know, do not mention anything about having no vision", true);
+      if (content != "Busy") {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+    } 
+    if (cancelled) {
+      return;
+    }
+    sendLongStringOverBLE(content + "<EOM>");
+  } else {
+      //regex only works with std::string type
+      std::string taskStd = task_selected.c_str();
+      // searching for 6 or 7 or 8
+      std::regex re6("^6\\s*,\\s*(.*)");
+      std::regex re7("^7\\s*,\\s*(.*)");
+      std::regex re8("^8\\s*,\\s*(.*)");
+
+      std::smatch match;
+      // TASK 6
+      if (std::regex_match(taskStd, match, re6)) {
+        Serial.println("Matched Task 6 with modifier: " + String(match[1].str().c_str()));
+        int commaIndex = task_selected.indexOf(',');
+
+        if (commaIndex != -1) {
+          String modifier = task_selected.substring(commaIndex + 1);
+          modifier.trim();
+
+          // Split into words: first = speed, second = length
+          int spaceIndex = modifier.indexOf(' ');
+          if (spaceIndex != -1) {
+            String first = modifier.substring(0, spaceIndex);
+            String second = modifier.substring(spaceIndex + 1);
+
+            if (first == "Fast" || first == "Normal") {
+              responseSpeed = first;
+            } else if (first == "Short" || first == "Long") {
+              responseLength = first;
+            }
+
+            if (second == "Fast" || second == "Normal") {
+              responseSpeed = second;
+            } else if (second == "Short" || second == "Long") {
+              responseLength = second;
+            }
+            responseSpeed.trim();
+            responseLength.trim();
+          } else {
+            if (modifier == "Fast" || modifier == "Normal") {
+              responseSpeed = modifier;
+            } else if (modifier == "Short" || modifier == "Long") {
+              responseLength = modifier;
+            }
+            responseSpeed.trim();
+            responseLength.trim();
+          }
+
+          Serial.println("Response speed set to: " + responseSpeed);
+          Serial.println("Response length set to: " + responseLength);
+          sendLongStringOverBLE("Response modified, speed is now " + responseSpeed + " and length is " + responseLength + "<EOM>");
+        }
+
+      } 
+      // TASK 7
+      else if (std::regex_match(taskStd, match, re7)) {
+        int commaIndex = task_selected.indexOf(',');
+
+        if (commaIndex != -1) {
+          String speedMod = task_selected.substring(commaIndex + 1);
+          speedMod.trim();
+
+          float newSpeed = speedMod.toFloat();
+          if (newSpeed >= 0.5 && newSpeed <= 2.0) {   // sanity check so it’s not zero/negative
+            Serial.println("TTS speed updated to: " + String(newSpeed));
+            sendLongStringOverBLE("TTS speed: " + String(newSpeed) + "<EOM>");
+          } else {
+            sendLongStringOverBLE("Received speed " + String(newSpeed) + " which is outside of 0.5 to 2.0 limit<EOM>");
+          }
+        }
+      }
+      // TASK 8
+      else if (std::regex_match(taskStd, match, re8)) {
+        int commaIndex = task_selected.indexOf(',');
+
+        if (commaIndex != -1) {
+          String timeoutStr = task_selected.substring(commaIndex + 1);
+          timeoutStr.trim();
+
+          int newTimeoutSec = timeoutStr.toInt();  // seconds
+          if (newTimeoutSec >= 5 && newTimeoutSec <= 20) {  // sanity check, e.g. max 20 seconds, min 5 seconds
+            RECORDING_TIMEOUT = newTimeoutSec * 1000;  // convert to ms
+            Serial.println("Recording timeout updated to: " + String(RECORDING_TIMEOUT) + " ms");
+            sendLongStringOverBLE("Recording timeout set to " + String(newTimeoutSec) + " seconds<EOM>");
+          } else {
+            sendLongStringOverBLE("Invalid timeout value: " + timeoutStr + " (must be 1–120 seconds)<EOM>");
+          }
+        }
+      } 
+    }
+}
+
+
+/*
+****************************************************************
+*******    PROCESSING INPUT
+****************************************************************
+*/
+void stopAndProcessRecording() {
+  String transcription = stopRecordingAndSend(true);
+
+  if (transcription == "Model Busy, Try Again") {
+    sendLongStringOverBLE("Model Busy, Try Again<EOM>");
+  }
+  else if (transcription == "cancel") {
+    return;
+  }
+  else if (transcription == "Mutex busy") {
+    sendLongStringOverBLE("Model Busy, Try Again<EOM>");
+  } 
+  else if (transcription.length() > 0) {
+    String task_selected = task_classification(transcription);
+    task_selected.trim();
+
+    if (task_selected == "Model is Busy, Try Again Later") {
+      sendLongStringOverBLE("Model is Busy, Try Again Later<EOM>");
+      return;
+    }
+
+    Serial.println("Selected task: " + task_selected);
+    performTask(task_selected, transcription);
+  } else {
+    Serial.println("No transcription received");
+    sendLongStringOverBLE("No audio transcribed<EOM>");
+  }
+}
+
+
+/*
+****************************************************************
+*******    LOOP
+****************************************************************
+*/
+void loop() {  
+  // Memory check - restart if critically low
+  if (ESP.getFreeHeap() < 10000) {
+    Serial.println("Critical memory low! Restarting...");
+    ESP.restart();
+  }
+
+  if (isRecording) {
+    size_t chunkSize;
+    uint8_t* chunk = i2s.recordWAV(1, &chunkSize);  
+    if (chunk && chunkSize > 0) {
+      audioBuffer.insert(audioBuffer.end(), chunk, chunk + chunkSize);
+      Serial.print("Recorded chunk: ");
+      Serial.println(chunkSize);
+      free(chunk);
+    } else {
+      Serial.println("No audio chunk captured");
+    }
+
+    // CHECK IF AUDIO RECORDING IS LONGER THAN START TIME THEN STOP
+    if (millis() - recordingStartTime >= RECORDING_TIMEOUT && isRecording && receivedCommand.length() == 0) {
+      if (millis() - lastStopTime < 1000) {
+          Serial.println("Stop command ignored (debounce after timeout)");
+          return;
+      }
+      lastStopTime = millis();
+
+      isRecording = false;
+      sendLongStringOverBLE("XStop<EOM>");
+      stopAndProcessRecording();
+    }
+  }
+
+  /*
+  ****************************************************************
+  *******    RECIEVED BLE COMMAND
+  ****************************************************************
+  */
+  if (receivedCommand.length() > 0) {
+    String command = receivedCommand;
+    receivedCommand = "";  
+    
+    command.trim();
+    command.toLowerCase();
+    
+    // -------------------- START
+    if ((command == "start" || command == "xstart")) {
+      if (!isRecording) {
+        cancelled = false;
+        if (command == "xstart") {
+          sendLongStringOverBLE("XStart<EOM>");
+        }
+        Serial.println("BLE: Starting recording");
+        startRecording();
+      } else {
+        return;
+      }
+    } 
+
+    // -------------------- STOP
+    else if ((command == "stop" || command == "xstop")) {
+      if (isRecording) {
+
+        if (millis() - lastStopTime < 1000) {
+          Serial.println("Stop command ignored (debounce after timeout)");
+          return;
+        }
+        lastStopTime = millis();
+          
+        isRecording = false;
+        if (command == "xstop") {
+          sendLongStringOverBLE("XStop<EOM>");
+        }
+        stopAndProcessRecording();
+      }
+    } 
+
+    // -------------------- CANCEL
+    else if (command == "cancel" || command == "xcancel" || cancelled) {
+      if (command == "xcancel") {
+        sendLongStringOverBLE("XCancel<EOM>", true);
+      }
+
+      if (isRecording) {
+        stopRecordingAndSend(false);
+        sendLongStringOverBLE("Recording cancelled<EOM>");
+      }
+      if (objectSearchTaskHandle != NULL) {
+        cancelObjectSearch = true;
+        Serial.println("Cancelling object search...");
+        sendLongStringOverBLE("Object search cancelled<EOM>");
+      }
+
+      cancelled = false;
+    } 
+    else if (command != "") {
+      // Handle other commands
+      int spaceIndex = command.indexOf(' ');
+      if (spaceIndex > 0) {
+        String keyStr = command.substring(0, spaceIndex);
+        String value = command.substring(spaceIndex + 1);
+        
+        int key = keyStr.toInt();
+        if (key != 0 || keyStr == "0") {
+          auto it = dictionary.find(key);
+          if (it != dictionary.end()) {
+            if (it->second == value.c_str()) {
+              Serial.println("Command " + String(key) + " already exists with same value. Continuing...");
+              String task_selected = String(task_correspondence[key].c_str());
+              performTask(task_selected, value);
+            } else {
+              Serial.println("Command " + String(key) + " exists but value is different. Updating...");
+              dictionary[key] = value.c_str();
+              String task_selected = task_classification(value);
+              task_selected.trim();
+              if (task_selected == "Model is Busy, Try Again Later") {
+                sendLongStringOverBLE("Model is Busy, Try Again Later<EOM>");
+                return;
+              }
+
+              task_correspondence[key] = task_selected;
+              performTask(task_selected, value);
+              Serial.println("Updated command " + String(key) + " with new value: " + value);
+            }
+          } else {
+            dictionary[key] = value.c_str();
+            String task_selected = task_classification(value);
+            task_selected.trim();
+            if (task_selected == "Model is Busy, Try Again Later") {
+              sendLongStringOverBLE("Model is Busy, Try Again Later<EOM>");
+              return;
+            }
+            task_correspondence[key] = task_selected;
+            performTask(task_selected, value);
+          }
+        } else {
+          String task_selected = task_classification(command);
+          task_selected.trim();
+          if (task_selected == "Model is Busy, Try Again Later") {
+            sendLongStringOverBLE("Model is Busy, Try Again Later<EOM>");
+            return;
+          }
+          performTask(task_selected, command);
+        }
+      } else {
+        String task_selected = task_classification(command);
+        performTask(task_selected, command);
+      }
+    }
+  }
+  
+  // BLE connection check (your existing code)
+  if (millis() - lastBLECheck > BLE_CHECK_INTERVAL) {
+    lastBLECheck = millis();
+    
+    if (pServer->getConnectedCount() < 2) {
+      both_connected = false;
+      Serial.println("Not enough BLE clients connected, ensuring advertising is active");
+      BLEDevice::getAdvertising()->start();
+      Serial.println("Restarted BLE advertising");
+      
+    }
+  }
+
+  if (!both_connected && pServer->getConnectedCount() == 2) {
+    sendLongStringOverBLE("Both devices connected<EOM>");
+    both_connected = true;
+  } 
+
+  // Periodically check WiFi
+  if (millis() - lastWifiCheck >= wifiCheckInterval) {
+    lastWifiCheck = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      sendLongStringOverBLE("Wifi disconnected, attempting to reconnect<EOM>");
+
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+
+      unsigned long startAttempt = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
+        delay(500);
+        Serial.print(".");
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        sendLongStringOverBLE("Reconnected to wifi<EOM>");
+        Serial.println("\nReconnected to WiFi!");
+      } else {
+        sendLongStringOverBLE("Connection failed, trying again in 30 seconds<EOM>");
+        Serial.println("\nReconnection failed.");
+      }
+    }
+  }
+}
+
+
+
